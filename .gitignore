@@ -16,3 +16,4 @@
 7095/7095/0.000.jpg
 utils/.crypto_key
 utils/.encrypted_keys
+utils/generate_keys.py
