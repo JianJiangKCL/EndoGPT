@@ -1,0 +1,1 @@
+python video2frame_fps.py --input /data/jj/datasets/video/websurg/5596.mp4 --output /data/jj/proj/EndoGPT/ --target_fps 5

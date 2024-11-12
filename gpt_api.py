@@ -87,7 +87,8 @@ class ImageAnalyzer:
         output_dir: str = None,
         supported_formats: tuple = ('.jpg', '.jpeg', '.png', '.gif'),
         save_results: bool = True,
-        batch_size: int = 10
+        batch_size: int = 10,
+        sampling: int = 5
     ) -> Dict[str, str]:
         """
         Analyze all images in a folder using parallel processing.
@@ -98,6 +99,9 @@ class ImageAnalyzer:
             output_dir (str, optional): Directory to save results. If None, uses folder_path/results
             supported_formats (tuple): Tuple of supported image file extensions
             save_results (bool): Whether to save results to a JSON file
+            batch_size (int): Number of images to process in parallel
+            sampling (int): Process every Nth frame. Default=1 means process all frames.
+                           sampling=2 means process every other frame, etc.
 
         Returns:
             Dict[str, str]: Dictionary mapping image paths to their analysis results
@@ -122,6 +126,9 @@ class ImageAnalyzer:
             and f.lower().endswith(supported_formats)
         ]
         image_files.sort(key=extract_number)  # Sort based on numerical value in filename
+
+        # After sorting, apply sampling to image_files
+        image_files = image_files[::sampling]  # Take every Nth item
 
         if not image_files:
             raise ValueError(f"No supported image files found in {folder_path}")
@@ -151,39 +158,52 @@ class ImageAnalyzer:
         results = {}
 
         def process_single_image(image_path):
-            try:
-                return os.path.basename(image_path), self.analyze_local_image(image_path, prompt)
-            except Exception as e:
-                return os.path.basename(image_path), f"Error processing image: {str(e)}"
+            max_retries = 3
+            retry_delay = 10  # seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    result = self.analyze_local_image(image_path, prompt)
+                    return os.path.basename(image_path), result
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    return os.path.basename(image_path), f"Error processing image after {max_retries} attempts: {str(e)}"
 
-        # Process images sequentially in sorted order
+        # Process images with results saving
         results = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Submit tasks in order
-            futures = [executor.submit(process_single_image, path) for path in image_paths]
+            futures_to_paths = {
+                executor.submit(process_single_image, path): path 
+                for path in image_paths
+            }
             
-            # Process results in order of completion
-            for future in tqdm(concurrent.futures.as_completed(futures), 
+            for future in tqdm(concurrent.futures.as_completed(futures_to_paths), 
                              total=len(image_paths), 
                              desc="Processing images"):
                 image_name, result = future.result()
                 results[image_name] = result
                 
-                # Save intermediate results
+                # Save intermediate results with atomic write
                 if save_results:
+                    temp_output_file = output_file + '.tmp'
                     current_data = {
                         "processing_stats": {
                             "total_images": len(image_paths),
-                            "timestamp_start": start_time.isoformat()
+                            "timestamp_start": start_time.isoformat(),
+                            "last_updated": datetime.now().isoformat()
                         },
                         "results": results
                     }
-                    with open(output_file, 'w', encoding='utf-8') as f:
+                    # Atomic write to prevent corruption
+                    with open(temp_output_file, 'w', encoding='utf-8') as f:
                         json.dump(current_data, f, indent=2, ensure_ascii=False)
+                    os.replace(temp_output_file, output_file)
 
         # Update final statistics
         end_time = time.time()
-        total_time = end_time - start_time
+        total_time = end_time - start_time.timestamp()
         avg_time_per_image = total_time / len(image_files)
 
         with open(output_file, 'r+', encoding='utf-8') as f:
@@ -204,6 +224,34 @@ class ImageAnalyzer:
         print(f"Average time per image: {round(avg_time_per_image, 2)} seconds")
         print(f"Results saved to: {output_file}")
 
+        # Retry failed images
+        failed_images = {
+            name: path for name, path in zip(image_files, image_paths)
+            if "Error processing image" in results.get(name, "")
+        }
+        
+        if failed_images:
+            print(f"\nRetrying {len(failed_images)} failed images...")
+            for name, path in failed_images.items():
+                try:
+                    _, result = process_single_image(path)
+                    results[name] = result
+                    # Update results file
+                    if save_results:
+                        current_data = {
+                            "processing_stats": {
+                                "total_images": len(image_paths),
+                                "timestamp_start": start_time.isoformat(),
+                                "last_updated": datetime.now().isoformat()
+                            },
+                            "results": results
+                        }
+                        with open(output_file + '.tmp', 'w', encoding='utf-8') as f:
+                            json.dump(current_data, f, indent=2, ensure_ascii=False)
+                        os.replace(output_file + '.tmp', output_file)
+                except Exception as e:
+                    print(f"Final retry failed for {name}: {str(e)}")
+
         return results
 
 #test
@@ -211,6 +259,9 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze endoscopic images using GPT-4 Vision')
     parser.add_argument('--input', required=True, help='Input image file or directory')
     parser.add_argument('--output-dir', help='Output directory for results (optional)')
+    parser.add_argument('--sampling', type=int, default=1, 
+                       help='Process every Nth frame. Default=1 means process all frames. '
+                            'sampling=2 means process every other frame, etc.')
     parser.add_argument('--prompt', default="Please analyze this image and provide response in EXACTLY the following format:\n\n"
                        "If this is a valid endoscopic image, output MUST be in this format:\n"
                        "Tissue: [describe visible tissue and anatomical structures]\n"
@@ -221,8 +272,8 @@ def main():
                        "Lighting: normal/dark/overexposed\n"
                        "Visibility: clear/partially obscured/heavily obscured (specify if due to glare/bubbles/debris)\n"
                        "Overall: good/fair/poor]\n\n"
-                       "If this is NOT a valid endoscopic image but contains text/slides:\n"
-                       "Output should begin with 'PureText:' followed by the main textual contents\n\n"
+                       "If this is NOT a valid endoscopic image but contains text/slides about surgical procedures or endoscopic knowledge:\n"
+                       "Output should begin with 'PureText:' followed by the main educational content about surgical techniques, anatomical descriptions, or procedural steps\n\n"
                        "If this is neither an endoscopic image nor text/slides:\n"
                        "Output EXACTLY this single line: 'No valid endoscopic image detected'\n\n"
                        "DO NOT include any other text, explanations, or descriptions beyond these formats.",
@@ -245,7 +296,8 @@ def main():
             folder_path=args.input,
             prompt=args.prompt,
             output_dir=args.output_dir,
-            save_results=True
+            save_results=True,
+            sampling=args.sampling
         )
 
 if __name__ == "__main__":
