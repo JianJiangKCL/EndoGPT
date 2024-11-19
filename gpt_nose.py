@@ -38,8 +38,8 @@ class ImageAnalyzer:
         stop=stop_after_attempt(3),
         reraise=True
     )
-    def analyze_local_image(self, image_path, prompt="What's in this image?"):
-        """Analyze image with rate limiting and retry logic"""
+    def analyze_local_image(self, image_path, prompt="What's in this image?", ref_image_path="/data/jj/proj/EndoGPT/ref.png"):
+        """Analyze image with rate limiting and retry logic, including a reference image"""
         try:
             # Ensure we respect rate limits
             current_time = time.time()
@@ -49,9 +49,12 @@ class ImageAnalyzer:
             
             self.last_request_time = time.time()
             
-            # Read and encode the image
+            # Read and encode both images
             with open(image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                input_image_data = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            with open(ref_image_path, "rb") as ref_file:
+                ref_image_data = base64.b64encode(ref_file.read()).decode('utf-8')
 
             response = self.client.chat.completions.create(
                 model="gpt-4-turbo",
@@ -59,11 +62,18 @@ class ImageAnalyzer:
                     {
                         "role": "user",
                         "content": [
+                            {"type": "text", "text": "Here is a reference image:"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{ref_image_data}"
+                                }
+                            },
                             {"type": "text", "text": prompt},
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
+                                    "url": f"data:image/jpeg;base64,{input_image_data}"
                                 }
                             }
                         ],
